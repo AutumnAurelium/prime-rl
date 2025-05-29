@@ -303,8 +303,21 @@ def train(config: Config):
 
                 # Log the samples to WandB with history management
                 try:
+                    # Get attribution weights for logging if attribution is enabled
+                    attribution_weights_for_logging = None
+                    if config.train.use_attribution:
+                        # Need to do a forward pass to get attribution weights for logging
+                        input_ids_log = batch["input_ids"].to("cuda")
+                        loss_mask_log = batch["loss_mask"].to("cuda")
+                        with torch.no_grad():
+                            _ = model(input_ids=input_ids_log, position_ids=batch["position_ids"])
+                            attribution_weights_for_logging = model.get_attribution_weights(loss_mask_log)
+                            attribution_weights_for_logging = attribution_weights_for_logging.cpu()
+                    
                     # Pass and update the sample history
-                    wandb_sample_history = log_prompt_response_samples(tokenizer, batch, training_progress.step, wandb_sample_history)
+                    wandb_sample_history = log_prompt_response_samples(
+                        tokenizer, batch, training_progress.step, wandb_sample_history, attribution_weights_for_logging
+                    )
                 except Exception as e:
                     logger.warning(f"Error logging samples to WandB: {e}")
 

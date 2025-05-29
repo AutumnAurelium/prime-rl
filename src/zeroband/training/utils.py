@@ -2,6 +2,7 @@ import socket
 import time
 from itertools import chain
 from typing import Any
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -280,7 +281,11 @@ def log_to_wandb(
 
 
 def log_prompt_response_samples(
-    tokenizer: PreTrainedTokenizer, batch: dict[str, torch.Tensor], step: int, sample_history: dict | None = None
+    tokenizer: PreTrainedTokenizer, 
+    batch: dict[str, torch.Tensor], 
+    step: int, 
+    sample_history: dict | None = None,
+    attribution_weights: torch.Tensor | None = None
 ) -> dict:
     """Log samples using wandb.Table with accumulated history.
     Only logs every 5 steps to minimize overhead.
@@ -290,6 +295,7 @@ def log_prompt_response_samples(
         batch: The current batch of data
         step: The current training step
         sample_history: Optional dict to store sample history between calls
+        attribution_weights: Optional attribution weights tensor [batch, seq]
     """
     if sample_history is None:
         sample_history = {
@@ -298,6 +304,7 @@ def log_prompt_response_samples(
             "completion": [],
             "rewards": [] if "rewards" in batch else None,
             "task_rewards": [] if "task_rewards" in batch else None,
+            "attribution_data": [] if attribution_weights is not None else None,
             "last_logged_step": -5,  # Initialize to trigger first logging
         }
 
@@ -324,6 +331,31 @@ def log_prompt_response_samples(
                 sample_history["rewards"].append(float(batch["rewards"][i].item()))
             if "task_rewards" in batch and sample_history["task_rewards"] is not None:
                 sample_history["task_rewards"].append(float(batch["task_rewards"][i].item()))
+                
+            # Log attribution data if available
+            if attribution_weights is not None and sample_history["attribution_data"] is not None:
+                # Get tokens and their attribution weights for the completion part
+                completion_tokens = tokens[response_start:]
+                completion_attributions = attribution_weights[i][response_start:len(tokens)].tolist()
+                
+                # Create a list of (token, attribution_weight) tuples for the completion
+                token_attribution_pairs = []
+                for j, (token_id, attr_weight) in enumerate(zip(completion_tokens, completion_attributions)):
+                    token_text = tokenizer.decode([token_id], skip_special_tokens=True)
+                    token_attribution_pairs.append({
+                        "token": token_text,
+                        "token_id": token_id,
+                        "attribution": attr_weight,
+                        "position": j
+                    })
+                
+                attribution_data = {
+                    "completion": completion,
+                    "tokens": token_attribution_pairs,
+                    "step": step,
+                    "sample_idx": i
+                }
+                sample_history["attribution_data"].append(attribution_data)
 
         if step >= sample_history["last_logged_step"] + 5:
             # Create table data dictionary (we are forced to remake it each time)
@@ -337,6 +369,31 @@ def log_prompt_response_samples(
             df = pd.DataFrame(table_data)
             table = wandb.Table(dataframe=df)
             wandb.log({"completions": table}, step=step)
+            
+            # Log attribution data as artifacts if available
+            if sample_history["attribution_data"] is not None and len(sample_history["attribution_data"]) > 0:
+                # Save attribution data as JSON artifact
+                import json
+                import tempfile
+                
+                attribution_artifact = wandb.Artifact(f"attribution_data_step_{step}", type="attribution")
+                
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                    json.dump(sample_history["attribution_data"], f, indent=2)
+                    attribution_artifact.add_file(f.name, name="attribution_data.json")
+                
+                wandb.log_artifact(attribution_artifact)
+                
+                # Also save locally for quick access
+                local_attribution_dir = Path("attribution_logs")
+                local_attribution_dir.mkdir(exist_ok=True)
+                
+                local_file = local_attribution_dir / f"step_{step}_attribution.json"
+                with open(local_file, 'w') as f:
+                    json.dump(sample_history["attribution_data"], f, indent=2)
+                
+                print(f"Attribution data saved locally to {local_file}")
+                
             sample_history["last_logged_step"] = step
 
         return sample_history
