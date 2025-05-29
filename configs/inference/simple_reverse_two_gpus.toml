@@ -1,4 +1,4 @@
-model_name = "Qwen/Qwen3-1.7B"
+model_name = "willcb/Qwen2.5-1.5B-Reverse-SFT"
 dataset = "PrimeIntellect/reverse_text_dataset_debug_50_seq_len"
 batch_size = 16
 dp = 1
