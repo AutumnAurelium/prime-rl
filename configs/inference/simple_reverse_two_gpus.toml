@@ -1,4 +1,4 @@
-model_name = "Qwen/Qwen3-4B"
+model_name = "Qwen/Qwen3-1.7B"
 dataset = "PrimeIntellect/reverse_text_dataset_debug_50_seq_len"
 batch_size = 16
 dp = 1
