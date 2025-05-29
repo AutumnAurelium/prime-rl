@@ -248,6 +248,7 @@ def log_to_wandb(
         "train/": ["step", "rollout_step", "inner_lr", "total_tokens", "total_samples"],
         "losses/": ["Loss", "pg_loss", "entropy_loss", "kl", "grad_norm", "clip_ratio"],
         "rewards/": ["sample_reward", "task_reward", "batch_reward", "batch_task_reward"],
+        "attribution/": ["attribution_entropy", "attribution_max", "attribution_min", "attribution_std"],
         "lengths/": [
             "seq_lens",
             "batch_seq_lens",

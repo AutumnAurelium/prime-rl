@@ -44,6 +44,77 @@ def grpo_loss(
     )
 
 
+@jaxtyped(typechecker=typechecker)
+def grpo_loss_with_attribution(
+    logits: Float[Tensor, "batch seq vocab"],
+    input_ids: Int[Tensor, "batch seq"],
+    advantages: Float[Tensor, "batch seq"],
+    attribution_weights: Float[Tensor, "batch seq"],
+    original_logprobs: Float[Tensor, "batch seq_minus_1"],
+    loss_mask: Int[Tensor, "batch seq"],
+    temperature: float,
+    epsilon_low: float,
+    epsilon_high: float,
+    clamp_log_prob_coef: float,
+    max_tokens: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    GRPO loss with learned attribution weights for advantages.
+    
+    Args:
+        logits: Policy model logits
+        input_ids: Input token IDs
+        advantages: Advantages for each token (before attribution)
+        attribution_weights: Learned attribution weights [batch, seq] that sum to 1
+        original_logprobs: Original log probabilities
+        loss_mask: Mask for valid tokens
+        temperature: Sampling temperature
+        epsilon_low: Lower clipping bound
+        epsilon_high: Upper clipping bound
+        clamp_log_prob_coef: Log probability clamping coefficient
+        max_tokens: Maximum number of tokens for normalization
+        
+    Returns:
+        loss: Policy gradient loss
+        clip_ratio: Clipping ratio
+        attribution_entropy: Entropy of attribution weights (for monitoring)
+    """
+    # Apply attribution weights to advantages inline to avoid circular import
+    # Only apply attribution to tokens that contribute to loss
+    valid_attribution = attribution_weights * loss_mask.float()
+    
+    # Renormalize attribution weights for valid tokens only
+    valid_sum = valid_attribution.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    normalized_attribution = valid_attribution / valid_sum
+    
+    # Apply attribution weights to advantages
+    # Scale by sequence length to maintain similar magnitude to original advantages
+    seq_len = loss_mask.float().sum(dim=-1, keepdim=True).clamp(min=1)
+    attributed_advantages = advantages * normalized_attribution * seq_len
+    
+    # Compute standard GRPO loss with attributed advantages
+    loss, clip_ratio = _compile_grpo_loss(
+        logits=logits,
+        input_ids=input_ids,
+        advantages=attributed_advantages,
+        original_logprobs=original_logprobs,
+        loss_mask=loss_mask,
+        temperature=temperature,
+        epsilon_low=epsilon_low,
+        epsilon_high=epsilon_high,
+        clamp_log_prob_coef=clamp_log_prob_coef,
+        max_tokens=max_tokens,
+    )
+    
+    # Compute attribution entropy for monitoring
+    # Higher entropy means more uniform attribution, lower means more focused
+    attribution_log_probs = torch.log(attribution_weights.clamp(min=1e-8))
+    attribution_entropy = -(attribution_weights * attribution_log_probs).sum(dim=-1)
+    attribution_entropy = _apply_mask(attribution_entropy, loss_mask, max_tokens)
+    
+    return loss, clip_ratio, attribution_entropy
+
+
 def selective_log_softmax(logits, index):
     """
     credits to https://github.com/huggingface/trl/blob/07cfe1677e552b7d5c92b7740e5b2f0b057661d8/trl/trainer/utils.py#L1659
@@ -119,6 +190,7 @@ def _compile_grpo_loss(
 
     is_clipped = (per_token_loss1 < per_token_loss2).float()
     clip_ratio = _apply_mask(is_clipped, loss_mask, max_tokens)
+
     return loss, clip_ratio
 
 

@@ -17,10 +17,11 @@ from torch._guards import log as torch_log
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard  # type: ignore
 
 from zeroband.training import envs
+from zeroband.training.attribution import AttributionWrapper
 from zeroband.training.checkpoint import TrainingProgress, load_checkpoint_fsdp_state, save_checkpoint_fsdp_state, save_ckpt_for_rollout
 from zeroband.training.config import Config
 from zeroband.training.data import BatchOutput, DatasetOutput, get_dataloader, packed_batch
-from zeroband.training.loss import entropy_loss, grpo_loss, kl_penalty, selective_log_softmax
+from zeroband.training.loss import entropy_loss, grpo_loss, grpo_loss_with_attribution, kl_penalty, selective_log_softmax
 from zeroband.training.lr_scheduler import get_scheduler
 from zeroband.training.utils import (
     MetricsAverager,
@@ -53,16 +54,36 @@ def get_local_batch_size(batch_size: int, micro_bs: int, data_workers: int, worl
     return batch_size
 
 
-def apply_fsdp(model: ModelType, reshard_after_forward: bool):
+def apply_fsdp(model: ModelType | AttributionWrapper, reshard_after_forward: bool):
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
-    for layer_id, transformer_block in enumerate(model.model.layers):
-        if reshard_after_forward:
-            layer_reshard_after_forward = layer_id < len(model.model.layers) - 1
-        else:
-            layer_reshard_after_forward = False
-        fully_shard(transformer_block, mp_policy=mp_policy, reshard_after_forward=layer_reshard_after_forward)
-    fully_shard(model, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward)
+    if isinstance(model, AttributionWrapper):
+        # Apply FSDP to the underlying model layers
+        target_model = model.model
+        for layer_id, transformer_block in enumerate(target_model.model.layers):
+            if reshard_after_forward:
+                layer_reshard_after_forward = layer_id < len(target_model.model.layers) - 1
+            else:
+                layer_reshard_after_forward = False
+            fully_shard(transformer_block, mp_policy=mp_policy, reshard_after_forward=layer_reshard_after_forward)
+        
+        # Apply FSDP to the underlying model
+        fully_shard(target_model, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward)
+        
+        # Apply FSDP to the attribution head
+        fully_shard(model.attribution_head, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward)
+        
+        # Apply FSDP to the wrapper itself
+        fully_shard(model, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward)
+    else:
+        # Original FSDP application for unwrapped models
+        for layer_id, transformer_block in enumerate(model.model.layers):
+            if reshard_after_forward:
+                layer_reshard_after_forward = layer_id < len(model.model.layers) - 1
+            else:
+                layer_reshard_after_forward = False
+            fully_shard(transformer_block, mp_policy=mp_policy, reshard_after_forward=layer_reshard_after_forward)
+        fully_shard(model, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward)
 
 
 def get_device_placement(gpus_ids: list[int] | None, world_info: WorldInfo) -> int:
@@ -73,7 +94,7 @@ def get_device_placement(gpus_ids: list[int] | None, world_info: WorldInfo) -> i
         return world_info.local_rank
 
 
-def get_logprobs(model: ModelType, input_ids: torch.Tensor, position_ids: torch.Tensor, temperature: float) -> torch.Tensor:
+def get_logprobs(model: ModelType | AttributionWrapper, input_ids: torch.Tensor, position_ids: torch.Tensor, temperature: float) -> torch.Tensor:
     logits: Float[torch.Tensor, "batch seq vocab"] = model(input_ids=input_ids, position_ids=position_ids).logits.contiguous()
 
     input_ids_shifted = input_ids[:, 1:]
@@ -112,19 +133,28 @@ def train(config: Config):
 
     model, tokenizer = get_model_and_tokenizer(config.model_name, config.train.attn_impl)
 
+    # Wrap model with attribution wrapper if enabled
+    if config.train.use_attribution:
+        logger.info("Enabling attribution mechanism")
+        model = AttributionWrapper(model)
+
     perf_counter = PerfCounter(window_size=min(10, 2 * config.optim.step_per_rollout), model=model, seq_len=config.data.seq_length)
 
     if config.train.liger_qwen:
+        # Need to apply to the underlying model if wrapped
+        target_model = model.model if config.train.use_attribution else model
         apply_liger_kernel_to_qwen2(
             rope=True,
             rms_norm=True,
             swiglu=True,
-            model=model,
+            model=target_model,
         )
 
     if config.train.ac_ckpt:
         num = 1 if isinstance(config.train.ac_ckpt, bool) else config.train.ac_ckpt
-        apply_ac_ckpt(model, num)
+        # Need to apply to the underlying model if wrapped
+        target_model = model.model if config.train.use_attribution else model
+        apply_ac_ckpt(target_model, num)
 
     apply_fsdp(model, config.train.reshard_after_forward)
 
@@ -310,19 +340,50 @@ def train(config: Config):
                 loss_mask = loss_mask.to("cuda")
                 original_logprobs = batch["logprobs"].to("cuda")
 
-                # Loss
-                pg_loss, clip_ratio = grpo_loss(
-                    logits,
-                    input_ids,
-                    advantages,
-                    original_logprobs,
-                    loss_mask,
-                    config.temperature,
-                    config.grpo_epsilon_low,
-                    config.grpo_epsilon_high,
-                    config.clamp_log_prob_coef,
-                    max_tokens,
-                )
+                # Loss computation with optional attribution
+                if config.train.use_attribution:
+                    # Get attribution weights from the model
+                    attribution_weights = model.get_attribution_weights(loss_mask)
+                    
+                    pg_loss, clip_ratio, attribution_entropy = grpo_loss_with_attribution(
+                        logits,
+                        input_ids,
+                        advantages,
+                        attribution_weights,
+                        original_logprobs,
+                        loss_mask,
+                        config.temperature,
+                        config.grpo_epsilon_low,
+                        config.grpo_epsilon_high,
+                        config.clamp_log_prob_coef,
+                        max_tokens,
+                    )
+                    
+                    # Track attribution metrics
+                    metric_averager.update("attribution_entropy", attribution_entropy.detach().clone())
+                    
+                    # Log attribution statistics
+                    with torch.no_grad():
+                        attribution_max = attribution_weights.max(dim=-1)[0].mean()
+                        attribution_min = attribution_weights.min(dim=-1)[0].mean()
+                        attribution_std = attribution_weights.std(dim=-1).mean()
+                        metric_averager.update("attribution_max", attribution_max)
+                        metric_averager.update("attribution_min", attribution_min)
+                        metric_averager.update("attribution_std", attribution_std)
+                else:
+                    # Standard GRPO loss
+                    pg_loss, clip_ratio = grpo_loss(
+                        logits,
+                        input_ids,
+                        advantages,
+                        original_logprobs,
+                        loss_mask,
+                        config.temperature,
+                        config.grpo_epsilon_low,
+                        config.grpo_epsilon_high,
+                        config.clamp_log_prob_coef,
+                        max_tokens,
+                    )
 
                 entropy = entropy_loss(logits, loss_mask, config.temperature, max_tokens)
 

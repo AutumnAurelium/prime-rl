@@ -35,6 +35,7 @@ class TrainConfig(BaseConfig):
     memory_profile: str | None = None
     torch_compile: bool = False  #  disabling torch compile because its too unstable for RL
     liger_qwen: bool = False
+    use_attribution: bool = False  # Enable learned advantage attribution
 
     attn_impl: AttnImpl = "flash_attention_2"
 
