@@ -109,8 +109,9 @@ def grpo_loss_with_attribution(
     # Compute attribution entropy for monitoring
     # Higher entropy means more uniform attribution, lower means more focused
     attribution_log_probs = torch.log(attribution_weights.clamp(min=1e-8))
-    attribution_entropy = -(attribution_weights * attribution_log_probs).sum(dim=-1)
-    attribution_entropy = _apply_mask(attribution_entropy, loss_mask, max_tokens)
+    per_token_attribution_entropy = -(attribution_weights * attribution_log_probs)
+    # Apply mask first, then aggregate
+    attribution_entropy = _apply_mask(per_token_attribution_entropy, loss_mask, max_tokens)
     
     return loss, clip_ratio, attribution_entropy
 
