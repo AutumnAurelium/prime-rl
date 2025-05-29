@@ -13,6 +13,11 @@ from zeroband.training.world_info import get_world_info
 from zeroband.utils.logger import get_logger
 from zeroband.utils.models import ModelType
 
+# Import AttributionWrapper for type checking
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from zeroband.training.attribution import AttributionWrapper
+
 
 @dataclass
 class TrainingProgress:
@@ -97,6 +102,7 @@ async_ckpt_job = None
 def save_ckpt_for_rollout(model: ModelType, path: Path, dtype: torch.dtype = torch.bfloat16, async_save: bool = False) -> Path:
     """
     Save the checkpoint for rollout as one unified safetensors file.
+    Only saves the base model weights, filtering out attribution head weights for inference compatibility.
 
     Return:
         Path to the saved checkpoint safetensor
@@ -114,16 +120,44 @@ def save_ckpt_for_rollout(model: ModelType, path: Path, dtype: torch.dtype = tor
 
     cpu_state = {}
 
-    for key, value in model.state_dict().items():
+    # Get state dict, filtering out attribution head weights for inference
+    full_state_dict = model.state_dict()
+    
+    # Check if model is wrapped with AttributionWrapper
+    from zeroband.training.attribution import AttributionWrapper
+    if isinstance(model, AttributionWrapper):
+        logger.info("Filtering out attribution head weights for inference compatibility")
+        # Only save the base model weights, not attribution head
+        state_dict = {}
+        original_key_mapping = {}  # Track mapping from filtered key to original key
+        
+        for original_key, value in full_state_dict.items():
+            if original_key.startswith("model."):
+                # Remove "model." prefix for base model weights
+                filtered_key = original_key[6:]
+                state_dict[filtered_key] = value
+                original_key_mapping[filtered_key] = original_key
+            elif not original_key.startswith("attribution_head."):
+                # Keep any other weights that aren't attribution head
+                state_dict[original_key] = value
+                original_key_mapping[original_key] = original_key
+    else:
+        state_dict = full_state_dict
+        original_key_mapping = {k: k for k in state_dict.keys()}
+
+    for key, value in state_dict.items():
         if isinstance(value, DTensor):
             value: DTensor = value.to(dtype)
             # only gather after the downcast to dtype as it will be faster
             value = value.full_tensor()  # ideally would only be gathered on rank 0
 
         if world_info.rank == 0:
-            key: set[str] = get_fqns(model, key)
-            assert len(key) == 1
-            key = next(iter(key))
+            # Use original key for get_fqns since it expects the model's actual parameter names
+            original_key = original_key_mapping[key]
+            key_fqn: set[str] = get_fqns(model, original_key)
+            assert len(key_fqn) == 1
+            key_fqn = next(iter(key_fqn))
+            # But save with the filtered key name for inference compatibility
             cpu_state[key] = value.to("cpu", non_blocking=True)
 
     logger.info(f"gathering full tensor checkpointing in {time.time() - start_time:.2f} seconds")
